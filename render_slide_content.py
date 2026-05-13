@@ -10,20 +10,23 @@
 Presentation orchestrator for the Capgemini Talk2Docs brand-aligned
 presentation agent.
 
-CHANGELOG (v2):
-  - Removed text truncation. Bullets and titles are written in full and
-    PowerPoint auto-shrinks the font to fit. This fixes the "..." ellipsis
-    appearing on every bullet.
-  - Stopped removing empty placeholders. The master's prompt text on the
-    Capgemini template is non-visible in the rendered slide, so removing
-    the placeholder was unnecessary and risky.
-  - Never modify DATE / FOOTER / SLIDE_NUMBER placeholders — they self-
-    populate from the master, and removing them strips footer branding
-    ("Presentation Title | Author | Date" and "Company Confidential
-    © Capgemini 2026. All rights reserved.").
-  - Bullet writing now preserves the layout's inherited bullet character.
-    Instead of clearing the text frame (which resets paragraph properties),
-    we replace text content while keeping the first paragraph's formatting.
+CHANGELOG (v3):
+  - v3: Footer/date/slide-number visibility now explicitly enabled on every
+        slide by writing the <p:hf> XML element. PowerPoint hides these
+        placeholders by default unless this flag is set — that's why
+        previous renders had no page numbers or footer branding.
+  - v3: The FOOTER placeholder is now populated with the deck title so the
+        "Presentation Title | Author | Date" branding line shows the actual
+        presentation name on every slide.
+  - v3: All footer plumbing happens AFTER content rendering so any
+        per-slide customization (e.g. removing footer on title slide) can
+        be done before save.
+
+  - v2: Removed text truncation. PowerPoint auto-shrinks the font.
+  - v2: Never touch DATE / FOOTER / SLIDE_NUMBER placeholders during
+        content rendering — they self-populate from the master.
+  - v2: Bullet writing preserves the layout's inherited bullet character
+        by reusing the first paragraph instead of clearing the text frame.
 """
 
 import asyncio
@@ -31,12 +34,15 @@ import json
 import os
 import tempfile
 import uuid
+from datetime import datetime
 
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
+from lxml import etree
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER_TYPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_PARAGRAPH_ALIGNMENT
+from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
 from ..shared_libraries.config import (
@@ -59,7 +65,8 @@ from .pptx_editor import _insert_visual_into_slide
 from .visual_generator import generate_visual
 
 
-# Placeholders we must never touch — they self-populate from the master.
+# Placeholders we must never overwrite during content rendering — they self-
+# populate from the master or are managed by separate footer plumbing.
 UNTOUCHABLE_PLACEHOLDER_TYPES = {
     PP_PLACEHOLDER_TYPE.DATE,
     PP_PLACEHOLDER_TYPE.FOOTER,
@@ -78,6 +85,63 @@ def _is_untouchable(placeholder) -> bool:
 
 
 # =============================================================================
+# Footer / date / slide-number enablement
+# =============================================================================
+
+# PowerPoint namespace for slide XML
+_NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+
+
+def _enable_slide_footer(slide, footer_text: str | None = None,
+                        show_date: bool = True,
+                        show_footer: bool = True,
+                        show_slide_number: bool = True):
+    """
+    Make footer/date/slide-number visible on this slide.
+
+    PowerPoint's default behaviour is that placeholders for footer/date/page
+    number exist on the slide layout but stay HIDDEN unless the slide's XML
+    has a <p:hf> element with the right attributes. python-pptx doesn't
+    expose this directly, so we add it via raw XML.
+
+    Also writes `footer_text` into the FOOTER placeholder if provided.
+    """
+    sld = slide._element  # the <p:sld> root
+
+    # Remove any existing <p:hf> element so we always set it fresh
+    for existing in sld.findall(qn("p:hf")):
+        sld.remove(existing)
+
+    # Build a new <p:hf> element with explicit visibility flags.
+    # Attributes default to "1" (show) when missing; we set them explicitly
+    # for clarity and to override any layout-level "0" (hide).
+    hf = etree.SubElement(sld, qn("p:hf"))
+    hf.set("hdr", "0")  # header (not used on slides; only notes/handout)
+    hf.set("ftr", "1" if show_footer else "0")
+    hf.set("dt", "1" if show_date else "0")
+    hf.set("sldNum", "1" if show_slide_number else "0")
+
+    # Move <p:hf> to the correct position in the schema (after <p:cSld>,
+    # before <p:clrMapOvr>, <p:transition>, <p:timing>).
+    csld = sld.find(qn("p:cSld"))
+    if csld is not None:
+        sld.remove(hf)
+        csld.addnext(hf)
+
+    # Write footer text into the FOOTER placeholder, if any exists on the slide
+    if show_footer and footer_text:
+        try:
+            for ph in slide.placeholders:
+                if ph.placeholder_format.type == PP_PLACEHOLDER_TYPE.FOOTER:
+                    # Use direct XML write so we don't accidentally call
+                    # placeholder.text = ... which can trigger autosize side-effects
+                    ph.text_frame.text = footer_text
+                    break
+        except Exception:
+            pass
+
+
+# =============================================================================
 # Layout selection
 # =============================================================================
 
@@ -91,7 +155,6 @@ def get_smart_layout(prs: Presentation, requested_name: str):
 
     layouts = prs.slide_layouts
 
-    # 1. Exact match
     for layout in layouts:
         if layout.name == requested_name:
             return layout
@@ -99,7 +162,6 @@ def get_smart_layout(prs: Presentation, requested_name: str):
         if layout.name.lower() == requested_name_lower:
             return layout
 
-    # 2. Keyword-based mapping to Capgemini layouts
     keyword_map = [
         ("cover", "Title Slide 1"),
         ("title slide", "Title Slide 1"),
@@ -137,7 +199,6 @@ def get_smart_layout(prs: Presentation, requested_name: str):
                     log.info(f"Mapped '{original_request}' -> '{target_layout_name}'")
                     return layout
 
-    # 3. Last resort
     for layout in layouts:
         if layout.name == "Content 1 Chapterbox":
             log.info(f"No match for '{original_request}', falling back to Content 1 Chapterbox")
@@ -167,10 +228,7 @@ def _enable_autofit(tf):
 
 
 def _write_simple_text(placeholder, text: str):
-    """
-    Write a single string into a placeholder, preserving inherited formatting.
-    No truncation — auto-fit handles overflow by shrinking the font.
-    """
+    """Write a string, preserving inherited formatting. No truncation."""
     if placeholder is None or not text:
         return
     if _is_untouchable(placeholder):
@@ -183,17 +241,7 @@ def _write_simple_text(placeholder, text: str):
 
 
 def _write_bullets_preserving_format(placeholder, bullets):
-    """
-    Write bullets WITHOUT clearing the text frame, so the layout's inherited
-    bullet character (•) and paragraph formatting survive.
-
-    Approach:
-      1. Reuse the first existing paragraph (which carries the layout's
-         bullet formatting via inheritance).
-      2. Replace its text content (remove existing runs, add new ones).
-      3. For subsequent bullets, add_paragraph() — new paragraphs inherit
-         the same level-0 formatting including bullet character.
-    """
+    """Write bullets while preserving the layout's bullet character."""
     if placeholder is None or not bullets:
         return
     if _is_untouchable(placeholder):
@@ -212,7 +260,6 @@ def _write_bullets_preserving_format(placeholder, bullets):
         )
         clean = bullet_text.strip(" \t-•*")
 
-        # Remove any existing runs in this paragraph (keeps <a:pPr> bullet props).
         for r in list(p.runs):
             r._r.getparent().remove(r._r)
 
@@ -227,11 +274,9 @@ def _write_bullets_preserving_format(placeholder, bullets):
             if j % 2 != 0:
                 run.font.bold = True
 
-    # First bullet → reuse first paragraph (preserves bullet character).
     first_p = tf.paragraphs[0]
     _set_paragraph_text(first_p, bullets[0], level=0)
 
-    # Subsequent bullets → add_paragraph() inherits formatting.
     for bullet in bullets[1:]:
         p = tf.add_paragraph()
         _set_paragraph_text(p, bullet, level=0)
@@ -257,29 +302,20 @@ def _insert_picture_into_placeholder(placeholder, image_source):
 
 def render_slide_content(slide, spec_obj, layout_name: str, prs=None,
                          log=None, is_cover: bool = False):
-    """
-    Populate a slide based on its layout and the spec's content.
-
-    Critical rules:
-      * Never write into or remove DATE/FOOTER/SLIDE_NUMBER placeholders.
-      * Never clear() a bullet text frame (strips the bullet character).
-      * Never truncate; PowerPoint auto-shrinks the font instead.
-    """
+    """Populate a slide based on its layout and the spec's content."""
     slot_map: SlotMap = get_slot_map(layout_name)
     treat_as_cover = is_cover or slot_map.is_cover
 
     if slot_map.is_end_slide or slot_map.is_blank:
         if log:
-            log.info(f"Layout '{layout_name}' has no text slots — skipping.")
+            log.info(f"Layout '{layout_name}' has no text slots — skipping content.")
         return
 
-    # 1. CHAPTER LABEL
     chapter_ph = get_placeholder_for_role(slide, layout_name, "chapter_label")
     chapter_text = getattr(spec_obj, "chapter_label", None)
     if chapter_ph is not None and chapter_text:
         _write_simple_text(chapter_ph, chapter_text)
 
-    # 2. TITLE
     title_ph = get_placeholder_for_role(slide, layout_name, "title")
     title_text = getattr(spec_obj, "title", None)
     if title_ph is not None and title_text:
@@ -292,13 +328,11 @@ def render_slide_content(slide, spec_obj, layout_name: str, prs=None,
             except Exception:
                 pass
 
-    # 3. SUBHEAD
     subhead_ph = get_placeholder_for_role(slide, layout_name, "subhead")
     subhead_text = getattr(spec_obj, "subhead", None)
     if subhead_ph is not None and subhead_text:
         _write_simple_text(subhead_ph, subhead_text)
 
-    # 4. COVER-ONLY SLOTS
     if treat_as_cover:
         cover_sub_ph = get_placeholder_for_role(slide, layout_name, "cover_subtitle")
         if cover_sub_ph is not None:
@@ -324,7 +358,6 @@ def render_slide_content(slide, spec_obj, layout_name: str, prs=None,
             _insert_picture_into_placeholder(picture_ph, image_source)
         return
 
-    # 5. BODY BULLETS
     has_bullets = (
         hasattr(spec_obj, "bullets") and bool(getattr(spec_obj, "bullets", None))
     )
@@ -346,7 +379,6 @@ def render_slide_content(slide, spec_obj, layout_name: str, prs=None,
         if body_third_ph is not None:
             _write_bullets_preserving_format(body_third_ph, bullets_third)
 
-    # 6. IMAGE
     image_source = (
         getattr(spec_obj, "image_data", None)
         or getattr(spec_obj, "image_file_path", None)
@@ -390,6 +422,25 @@ DEFAULT_IMAGE_LAYOUT = "Content 2 Chapterbox"
 
 
 # =============================================================================
+# Footer policy — decides which slides show the footer
+# =============================================================================
+
+def _should_show_footer_on_layout(layout_name: str) -> bool:
+    """
+    Layouts where the footer/page number should appear.
+
+    Cover and end-slide layouts typically don't show the footer (it would
+    visually compete with the cover design). Workhorse content layouts always
+    show it.
+    """
+    slot_map = get_slot_map(layout_name)
+    # No footer on the cover or final thank-you slide
+    if slot_map.is_cover or slot_map.is_end_slide:
+        return False
+    return True
+
+
+# =============================================================================
 # render_deck_from_spec
 # =============================================================================
 
@@ -411,10 +462,26 @@ async def render_deck_from_spec(
 
         prs = Presentation(working_template)
 
-        # COVER
+        # The deck title becomes the left-side footer text on body slides.
         cover_data = spec_dict.get("cover", {"title": "Strategic Research & Analysis"})
         cover_spec = CoverSpec(**cover_data)
+        deck_title = cover_spec.title or "Presentation"
 
+        # Build the footer line. Capgemini convention: "Title | Author | Date"
+        # If author is provided in spec, include it; otherwise just title + date.
+        author = (
+            spec_dict.get("author")
+            or getattr(cover_spec, "author_line", None)
+            or ""
+        )
+        date_str = spec_dict.get("date") or datetime.now().strftime("%B %Y")
+        footer_parts = [deck_title]
+        if author:
+            footer_parts.append(author)
+        footer_parts.append(date_str)
+        footer_text = " | ".join(footer_parts)
+
+        # COVER
         if len(prs.slides) > 0:
             for i in range(len(prs.slides) - 1, 0, -1):
                 rId = prs.slides._sldIdLst[i].rId
@@ -439,6 +506,10 @@ async def render_deck_from_spec(
                 )
             except Exception as e:
                 log.warning(f"Could not render cover on existing slide: {e}")
+            # Cover gets no footer
+            _enable_slide_footer(cover_slide, footer_text=None,
+                                  show_date=False, show_footer=False,
+                                  show_slide_number=False)
         else:
             log.info("Template is empty. Generating a new Cover Page.")
             try:
@@ -447,6 +518,9 @@ async def render_deck_from_spec(
                     cover_slide, cover_spec, cover_layout_name,
                     prs=prs, log=log, is_cover=True,
                 )
+                _enable_slide_footer(cover_slide, footer_text=None,
+                                      show_date=False, show_footer=False,
+                                      show_slide_number=False)
             except Exception as e:
                 log.warning(f"Could not generate/render cover slide: {e}")
 
@@ -463,6 +537,16 @@ async def render_deck_from_spec(
                 render_slide_content(
                     slide, s_spec, actual_layout_name,
                     prs=prs, log=log,
+                )
+
+                # Enable footer per layout policy
+                show = _should_show_footer_on_layout(actual_layout_name)
+                _enable_slide_footer(
+                    slide,
+                    footer_text=footer_text if show else None,
+                    show_date=show,
+                    show_footer=show,
+                    show_slide_number=show,
                 )
             except Exception as e:
                 log.error(f"Failed to render slide '{s_data.get('title')}': {e}")
@@ -507,10 +591,14 @@ async def render_deck_from_spec(
                     closing, closing_spec, actual_closing_name,
                     prs=prs, log=log,
                 )
+
+            # End-slide / Conclusion / Thank-you: no footer
+            _enable_slide_footer(closing, footer_text=None,
+                                  show_date=False, show_footer=False,
+                                  show_slide_number=False)
         except Exception as e:
             log.warning(f"Could not generate closing slide: {e}")
 
-        # SAVE
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
             prs.save(tmp.name)
             return tmp.name
