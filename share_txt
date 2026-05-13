@@ -2,3 +2,4 @@
 cd python/agents/brand-aligned-presentations
 uv run python -c "from presentation_agent.tools.layout_router import LAYOUT_MAP; print(len(LAYOUT_MAP))"
 
+uv run python validate_template.py path/to/your/capgemini_template.pptx
